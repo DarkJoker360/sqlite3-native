@@ -25,6 +25,72 @@ await sql.exec(`SELECT NAME FROM records;`)
 // ]
 ```
 
+### Prepared statements
+
+Use prepared statements for user input and values that should not be manually interpolated into SQL:
+
+```js
+const insert = await sql.prepare('INSERT INTO records (NAME) VALUES (?)')
+
+await insert.run('Jane')
+await insert.run('John')
+
+await insert.finalize()
+```
+
+Statements expose `run()`, `get()`, `all()`, and `finalize()`:
+
+```js
+const select = await sql.prepare('SELECT NAME AS name FROM records WHERE NAME = ?')
+
+const row = await select.get('Jane')
+
+// { name: 'Jane' }
+
+await select.finalize()
+```
+
+### Typed values and BLOBs
+
+Prepared statement results preserve SQLite value types:
+
+```js
+await sql.exec('CREATE TABLE vectors (ID INTEGER, EMBEDDING BLOB, NOTE TEXT);')
+
+const embedding = Buffer.from([0, 1, 2, 3])
+const insertVector = await sql.prepare('INSERT INTO vectors VALUES (?, ?, ?)')
+
+await insertVector.run(1, embedding, null)
+
+const selectVector = await sql.prepare(
+  'SELECT ID AS id, EMBEDDING AS embedding, NOTE AS note FROM vectors'
+)
+const vector = await selectVector.get()
+
+// {
+//   id: 1,
+//   embedding: Buffer.from([0, 1, 2, 3]),
+//   note: null
+// }
+```
+
+Values can be bound as `null`, numbers, strings, `Buffer`, typed arrays, or `ArrayBuffer`.
+
+### Durable files
+
+By default, `new SQLite3()` uses the in-memory JavaScript VFS. Pass `filename` to use SQLite's native file-backed storage:
+
+```js
+const appDb = new SQLite3({ filename: 'qvac.db' })
+const ragDb = new SQLite3({ filename: 'rag-vectors.db' })
+```
+
+Custom VFS implementations remain available:
+
+```js
+const memory = new SQLite3({ vfs: new SQLite3.MemoryVFS() })
+```
+
 ## License
 
 Apache-2.0

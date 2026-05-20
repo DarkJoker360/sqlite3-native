@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <bare.h>
 #include <js.h>
+#include <math.h>
 #include <sqlite3.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -132,6 +133,99 @@ typedef struct {
 
   uv_sem_t done;
 } sqlite3_native_exec_t;
+
+typedef struct {
+  sqlite3_stmt *handle;
+
+  sqlite3_native_t *db;
+  js_env_t *env;
+} sqlite3_native_statement_t;
+
+enum {
+  SQLITE3_NATIVE_BIND_NULL = 0,
+  SQLITE3_NATIVE_BIND_INTEGER = 1,
+  SQLITE3_NATIVE_BIND_FLOAT = 2,
+  SQLITE3_NATIVE_BIND_TEXT = 3,
+  SQLITE3_NATIVE_BIND_BLOB = 4,
+};
+
+typedef struct {
+  int type;
+
+  int64_t integer;
+  double real;
+
+  void *data;
+  int len;
+} sqlite3_native_bind_t;
+
+typedef struct {
+  int type;
+
+  char *name;
+
+  int64_t integer;
+  double real;
+
+  void *data;
+  int len;
+} sqlite3_native_column_t;
+
+typedef struct {
+  int len;
+
+  sqlite3_native_column_t *columns;
+} sqlite3_native_row_t;
+
+typedef struct {
+  uv_work_t handle;
+
+  sqlite3_native_statement_t *statement;
+
+  js_deferred_t *deferred;
+  js_ref_t *result;
+
+  utf8_t *query;
+
+  char *error;
+} sqlite3_native_prepare_t;
+
+enum {
+  SQLITE3_NATIVE_STATEMENT_RUN = 0,
+  SQLITE3_NATIVE_STATEMENT_ALL = 1,
+  SQLITE3_NATIVE_STATEMENT_GET = 2,
+};
+
+typedef struct {
+  uv_work_t handle;
+
+  sqlite3_native_statement_t *statement;
+
+  js_deferred_t *deferred;
+
+  int mode;
+
+  uint32_t bind_count;
+  sqlite3_native_bind_t *binds;
+
+  uint32_t row_count;
+  sqlite3_native_row_t *rows;
+
+  int changes;
+  sqlite3_int64 last_insert_rowid;
+
+  char *error;
+} sqlite3_native_statement_exec_t;
+
+typedef struct {
+  uv_work_t handle;
+
+  sqlite3_native_statement_t *statement;
+
+  js_deferred_t *deferred;
+
+  char *error;
+} sqlite3_native_statement_finalize_t;
 
 static const size_t sqlite3_native__queue_limit = 64;
 
@@ -914,6 +1008,366 @@ sqlite3_native__on_result(void *arg, int len, char **rows, char **columns) {
   return SQLITE_OK;
 }
 
+static void
+sqlite3_native__free_binds(sqlite3_native_bind_t *binds, uint32_t len) {
+  if (binds == NULL) return;
+
+  for (uint32_t i = 0; i < len; i++) {
+    free(binds[i].data);
+  }
+
+  free(binds);
+}
+
+static void
+sqlite3_native__free_row(sqlite3_native_row_t *row) {
+  for (int j = 0; j < row->len; j++) {
+    free(row->columns[j].name);
+    free(row->columns[j].data);
+  }
+
+  free(row->columns);
+}
+
+static void
+sqlite3_native__free_rows(sqlite3_native_row_t *rows, uint32_t len) {
+  if (rows == NULL) return;
+
+  for (uint32_t i = 0; i < len; i++) {
+    sqlite3_native__free_row(&rows[i]);
+  }
+
+  free(rows);
+}
+
+static char *
+sqlite3_native__sqlite_error(sqlite3 *db) {
+  return sqlite3_mprintf("%s", sqlite3_errmsg(db));
+}
+
+static int
+sqlite3_native__copy_string(js_env_t *env, js_value_t *value, sqlite3_native_bind_t *bind) {
+  int err;
+
+  size_t len;
+  err = js_get_value_string_utf8(env, value, NULL, 0, &len);
+  if (err < 0) return err;
+
+  utf8_t *data = malloc(len + 1 /* NULL */);
+
+  err = js_get_value_string_utf8(env, value, data, len + 1 /* NULL */, NULL);
+  if (err < 0) {
+    free(data);
+    return err;
+  }
+
+  bind->type = SQLITE3_NATIVE_BIND_TEXT;
+  bind->data = data;
+  bind->len = (int) len;
+
+  return 0;
+}
+
+static int
+sqlite3_native__copy_arraybuffer(js_env_t *env, js_value_t *value, sqlite3_native_bind_t *bind) {
+  int err;
+
+  void *data;
+  size_t len;
+  err = js_get_arraybuffer_info(env, value, &data, &len);
+  if (err < 0) return err;
+
+  void *copy = len == 0 ? NULL : malloc(len);
+  if (len > 0) memcpy(copy, data, len);
+
+  bind->type = SQLITE3_NATIVE_BIND_BLOB;
+  bind->data = copy;
+  bind->len = (int) len;
+
+  return 0;
+}
+
+static int
+sqlite3_native__parse_binds(js_env_t *env, js_value_t *array, sqlite3_native_bind_t **result, uint32_t *result_len) {
+  int err;
+
+  uint32_t len;
+  err = js_get_array_length(env, array, &len);
+  if (err < 0) return err;
+
+  sqlite3_native_bind_t *binds = len == 0 ? NULL : calloc(len, sizeof(sqlite3_native_bind_t));
+
+  for (uint32_t i = 0; i < len; i++) {
+    js_value_t *value;
+    err = js_get_element(env, array, i, &value);
+    if (err < 0) {
+      sqlite3_native__free_binds(binds, len);
+      return err;
+    }
+
+    sqlite3_native_bind_t *bind = &binds[i];
+
+    js_value_type_t type;
+    err = js_typeof(env, value, &type);
+    if (err < 0) {
+      sqlite3_native__free_binds(binds, len);
+      return err;
+    }
+
+    if (type == js_null || type == js_undefined) {
+      bind->type = SQLITE3_NATIVE_BIND_NULL;
+      continue;
+    }
+
+    bool is_arraybuffer = false;
+    err = js_is_arraybuffer(env, value, &is_arraybuffer);
+    if (err < 0) {
+      sqlite3_native__free_binds(binds, len);
+      return err;
+    }
+
+    if (is_arraybuffer) {
+      err = sqlite3_native__copy_arraybuffer(env, value, bind);
+      if (err < 0) {
+        sqlite3_native__free_binds(binds, len);
+        return err;
+      }
+      continue;
+    }
+
+    if (type == js_number) {
+      double number;
+      err = js_get_value_double(env, value, &number);
+      if (err < 0) {
+        sqlite3_native__free_binds(binds, len);
+        return err;
+      }
+
+      double integral;
+      if (modf(number, &integral) == 0.0) {
+        bind->type = SQLITE3_NATIVE_BIND_INTEGER;
+        bind->integer = (int64_t) integral;
+      } else {
+        bind->type = SQLITE3_NATIVE_BIND_FLOAT;
+        bind->real = number;
+      }
+
+      continue;
+    }
+
+    if (type == js_string) {
+      err = sqlite3_native__copy_string(env, value, bind);
+      if (err < 0) {
+        sqlite3_native__free_binds(binds, len);
+        return err;
+      }
+      continue;
+    }
+
+    sqlite3_native__free_binds(binds, len);
+    return -1;
+  }
+
+  *result = binds;
+  *result_len = len;
+
+  return 0;
+}
+
+static int
+sqlite3_native__bind_values(sqlite3_native_statement_exec_t *req) {
+  int err;
+
+  sqlite3_stmt *statement = req->statement->handle;
+
+  err = sqlite3_reset(statement);
+  if (err != SQLITE_OK) return err;
+
+  err = sqlite3_clear_bindings(statement);
+  if (err != SQLITE_OK) return err;
+
+  for (uint32_t i = 0; i < req->bind_count; i++) {
+    sqlite3_native_bind_t *bind = &req->binds[i];
+    int index = (int) i + 1;
+
+    switch (bind->type) {
+    case SQLITE3_NATIVE_BIND_NULL:
+      err = sqlite3_bind_null(statement, index);
+      break;
+    case SQLITE3_NATIVE_BIND_INTEGER:
+      err = sqlite3_bind_int64(statement, index, bind->integer);
+      break;
+    case SQLITE3_NATIVE_BIND_FLOAT:
+      err = sqlite3_bind_double(statement, index, bind->real);
+      break;
+    case SQLITE3_NATIVE_BIND_TEXT:
+      err = sqlite3_bind_text(statement, index, bind->data, bind->len, SQLITE_TRANSIENT);
+      break;
+    case SQLITE3_NATIVE_BIND_BLOB:
+      err = sqlite3_bind_blob(statement, index, bind->data, bind->len, SQLITE_TRANSIENT);
+      break;
+    default:
+      err = SQLITE_MISUSE;
+      break;
+    }
+
+    if (err != SQLITE_OK) return err;
+  }
+
+  return SQLITE_OK;
+}
+
+static int
+sqlite3_native__copy_column(sqlite3_stmt *statement, int index, sqlite3_native_column_t *column) {
+  const char *name = sqlite3_column_name(statement, index);
+  if (name == NULL) name = "";
+
+  size_t name_len = strlen(name);
+  column->name = malloc(name_len + 1 /* NULL */);
+  memcpy(column->name, name, name_len + 1 /* NULL */);
+  column->type = sqlite3_column_type(statement, index);
+
+  switch (column->type) {
+  case SQLITE_NULL:
+    break;
+  case SQLITE_INTEGER:
+    column->integer = sqlite3_column_int64(statement, index);
+    break;
+  case SQLITE_FLOAT:
+    column->real = sqlite3_column_double(statement, index);
+    break;
+  case SQLITE_TEXT: {
+    int len = sqlite3_column_bytes(statement, index);
+    const void *data = sqlite3_column_text(statement, index);
+
+    column->data = malloc(len + 1 /* NULL */);
+    memcpy(column->data, data, len);
+    ((char *) column->data)[len] = '\0';
+    column->len = len;
+    break;
+  }
+  case SQLITE_BLOB: {
+    int len = sqlite3_column_bytes(statement, index);
+    const void *data = sqlite3_column_blob(statement, index);
+
+    column->data = len == 0 ? NULL : malloc(len);
+    if (len > 0) memcpy(column->data, data, len);
+    column->len = len;
+    break;
+  }
+  default:
+    return SQLITE_MISUSE;
+  }
+
+  return SQLITE_OK;
+}
+
+static int
+sqlite3_native__append_row(sqlite3_native_statement_exec_t *req) {
+  sqlite3_stmt *statement = req->statement->handle;
+
+  int len = sqlite3_column_count(statement);
+
+  sqlite3_native_row_t row = {
+    len,
+    len == 0 ? NULL : calloc(len, sizeof(sqlite3_native_column_t))
+  };
+
+  for (int i = 0; i < len; i++) {
+    int err = sqlite3_native__copy_column(statement, i, &row.columns[i]);
+    if (err != SQLITE_OK) {
+      sqlite3_native__free_row(&row);
+      return err;
+    }
+  }
+
+  sqlite3_native_row_t *rows = realloc(req->rows, sizeof(sqlite3_native_row_t) * (req->row_count + 1));
+  if (rows == NULL) {
+    sqlite3_native__free_row(&row);
+    return SQLITE_NOMEM;
+  }
+
+  req->rows = rows;
+  req->rows[req->row_count++] = row;
+
+  return SQLITE_OK;
+}
+
+static int
+sqlite3_native__set_column_value(js_env_t *env, js_value_t *row, sqlite3_native_column_t *column) {
+  int err;
+
+  js_value_t *value;
+
+  switch (column->type) {
+  case SQLITE_NULL:
+    err = js_get_null(env, &value);
+    assert(err == 0);
+    break;
+  case SQLITE_INTEGER:
+    err = js_create_int64(env, column->integer, &value);
+    assert(err == 0);
+    break;
+  case SQLITE_FLOAT:
+    err = js_create_double(env, column->real, &value);
+    assert(err == 0);
+    break;
+  case SQLITE_TEXT:
+    err = js_create_string_utf8(env, (utf8_t *) column->data, column->len, &value);
+    assert(err == 0);
+    break;
+  case SQLITE_BLOB: {
+    void *data;
+    err = js_create_arraybuffer(env, column->len, &data, &value);
+    assert(err == 0);
+    if (column->len > 0) memcpy(data, column->data, column->len);
+    break;
+  }
+  default:
+    err = js_get_undefined(env, &value);
+    assert(err == 0);
+    break;
+  }
+
+  err = js_set_named_property(env, row, column->name, value);
+  assert(err == 0);
+
+  return 0;
+}
+
+static int
+sqlite3_native__create_row(js_env_t *env, sqlite3_native_row_t *source, js_value_t **result) {
+  int err;
+
+  js_value_t *row;
+  err = js_create_object(env, &row);
+  assert(err == 0);
+
+  for (int i = 0; i < source->len; i++) {
+    sqlite3_native__set_column_value(env, row, &source->columns[i]);
+  }
+
+  *result = row;
+
+  return 0;
+}
+
+static void
+sqlite3_native__reject_deferred(js_env_t *env, js_deferred_t *deferred, char *error) {
+  int err;
+
+  js_value_t *message;
+  err = js_create_string_utf8(env, (utf8_t *) error, -1, &message);
+  assert(err == 0);
+
+  js_value_t *result;
+  err = js_create_error(env, NULL, message, &result);
+  assert(err == 0);
+
+  err = js_reject_deferred(env, deferred, result);
+  assert(err == 0);
+}
+
 static js_value_t *
 sqlite3_native_init(js_env_t *env, js_callback_info_t *info) {
   int err;
@@ -965,7 +1419,7 @@ sqlite3_native__on_before_open(uv_work_t *handle) {
 
   sqlite3_native_open_t *req = (sqlite3_native_open_t *) handle->data;
 
-  err = sqlite3_open_v2((char *) req->name, &req->db->handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, req->vfs->name);
+  err = sqlite3_open_v2((char *) req->name, &req->db->handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, req->vfs == NULL ? NULL : req->vfs->name);
   assert(err == 0);
 }
 
@@ -989,9 +1443,16 @@ sqlite3_native_open(js_env_t *env, js_callback_info_t *info) {
   err = js_get_arraybuffer_info(env, argv[0], (void **) &db, NULL);
   assert(err == 0);
 
-  sqlite3_native_vfs_t *vfs;
-  err = js_get_arraybuffer_info(env, argv[1], (void **) &vfs, NULL);
+  sqlite3_native_vfs_t *vfs = NULL;
+
+  js_value_type_t vfs_type;
+  err = js_typeof(env, argv[1], &vfs_type);
   assert(err == 0);
+
+  if (vfs_type != js_null && vfs_type != js_undefined) {
+    err = js_get_arraybuffer_info(env, argv[1], (void **) &vfs, NULL);
+    assert(err == 0);
+  }
 
   sqlite3_native_path_t name;
   err = js_get_value_string_utf8(env, argv[2], name, sizeof(name), NULL);
@@ -1209,6 +1670,351 @@ sqlite3_native_exec(js_env_t *env, js_callback_info_t *info) {
   return promise;
 }
 
+static void
+sqlite3_native__on_after_prepare(uv_work_t *handle, int status) {
+  int err;
+
+  sqlite3_native_prepare_t *req = (sqlite3_native_prepare_t *) handle->data;
+
+  sqlite3_native_statement_t *statement = req->statement;
+
+  js_env_t *env = statement->env;
+
+  js_handle_scope_t *scope;
+  err = js_open_handle_scope(env, &scope);
+  assert(err == 0);
+
+  if (req->error) {
+    sqlite3_native__reject_deferred(env, req->deferred, req->error);
+    sqlite3_free(req->error);
+  } else {
+    js_value_t *result;
+    err = js_get_reference_value(env, req->result, &result);
+    assert(err == 0);
+
+    err = js_resolve_deferred(env, req->deferred, result);
+    assert(err == 0);
+  }
+
+  err = js_close_handle_scope(env, scope);
+  assert(err == 0);
+
+  err = js_delete_reference(env, req->result);
+  assert(err == 0);
+
+  free(req->query);
+  free(req);
+}
+
+static void
+sqlite3_native__on_before_prepare(uv_work_t *handle) {
+  sqlite3_native_prepare_t *req = (sqlite3_native_prepare_t *) handle->data;
+
+  int err = sqlite3_prepare_v2(req->statement->db->handle, (const char *) req->query, -1, &req->statement->handle, NULL);
+  if (err != SQLITE_OK) req->error = sqlite3_native__sqlite_error(req->statement->db->handle);
+}
+
+static js_value_t *
+sqlite3_native_prepare(js_env_t *env, js_callback_info_t *info) {
+  int err;
+
+  size_t argc = 2;
+  js_value_t *argv[2];
+
+  err = js_get_callback_info(env, info, &argc, argv, NULL, NULL);
+  assert(err == 0);
+
+  assert(argc == 2);
+
+  uv_loop_t *loop;
+  err = js_get_env_loop(env, &loop);
+  assert(err == 0);
+
+  sqlite3_native_t *db;
+  err = js_get_arraybuffer_info(env, argv[0], (void **) &db, NULL);
+  assert(err == 0);
+
+  size_t query_len;
+  err = js_get_value_string_utf8(env, argv[1], NULL, 0, &query_len);
+  assert(err == 0);
+
+  query_len += 1 /* NULL */;
+
+  utf8_t *query = (utf8_t *) malloc(query_len);
+
+  err = js_get_value_string_utf8(env, argv[1], query, query_len, NULL);
+  assert(err == 0);
+
+  js_value_t *result;
+
+  sqlite3_native_statement_t *statement;
+  err = js_create_arraybuffer(env, sizeof(sqlite3_native_statement_t), (void **) &statement, &result);
+  assert(err == 0);
+
+  statement->db = db;
+  statement->env = env;
+  statement->handle = NULL;
+
+  sqlite3_native_prepare_t *req = calloc(1, sizeof(sqlite3_native_prepare_t));
+
+  req->statement = statement;
+  req->query = query;
+
+  req->handle.data = (void *) req;
+
+  err = js_create_reference(env, result, 1, &req->result);
+  assert(err == 0);
+
+  js_value_t *promise;
+  err = js_create_promise(env, &req->deferred, &promise);
+  assert(err == 0);
+
+  err = uv_queue_work(loop, &req->handle, sqlite3_native__on_before_prepare, sqlite3_native__on_after_prepare);
+  assert(err == 0);
+
+  return promise;
+}
+
+static void
+sqlite3_native__on_after_statement_exec(uv_work_t *handle, int status) {
+  int err;
+
+  sqlite3_native_statement_exec_t *req = (sqlite3_native_statement_exec_t *) handle->data;
+
+  js_env_t *env = req->statement->env;
+
+  js_handle_scope_t *scope;
+  err = js_open_handle_scope(env, &scope);
+  assert(err == 0);
+
+  if (req->error) {
+    sqlite3_native__reject_deferred(env, req->deferred, req->error);
+    sqlite3_free(req->error);
+  } else if (req->mode == SQLITE3_NATIVE_STATEMENT_RUN) {
+    js_value_t *result;
+    err = js_create_object(env, &result);
+    assert(err == 0);
+
+    js_value_t *changes;
+    err = js_create_int64(env, req->changes, &changes);
+    assert(err == 0);
+
+    err = js_set_named_property(env, result, "changes", changes);
+    assert(err == 0);
+
+    js_value_t *last_insert_rowid;
+    err = js_create_int64(env, req->last_insert_rowid, &last_insert_rowid);
+    assert(err == 0);
+
+    err = js_set_named_property(env, result, "lastInsertRowid", last_insert_rowid);
+    assert(err == 0);
+
+    err = js_resolve_deferred(env, req->deferred, result);
+    assert(err == 0);
+  } else if (req->mode == SQLITE3_NATIVE_STATEMENT_GET) {
+    js_value_t *result;
+
+    if (req->row_count == 0) {
+      err = js_get_null(env, &result);
+      assert(err == 0);
+    } else {
+      sqlite3_native__create_row(env, &req->rows[0], &result);
+    }
+
+    err = js_resolve_deferred(env, req->deferred, result);
+    assert(err == 0);
+  } else {
+    js_value_t *result;
+    err = js_create_array_with_length(env, req->row_count, &result);
+    assert(err == 0);
+
+    for (uint32_t i = 0; i < req->row_count; i++) {
+      js_value_t *row;
+      sqlite3_native__create_row(env, &req->rows[i], &row);
+
+      err = js_set_element(env, result, i, row);
+      assert(err == 0);
+    }
+
+    err = js_resolve_deferred(env, req->deferred, result);
+    assert(err == 0);
+  }
+
+  err = js_close_handle_scope(env, scope);
+  assert(err == 0);
+
+  sqlite3_native__free_binds(req->binds, req->bind_count);
+  sqlite3_native__free_rows(req->rows, req->row_count);
+
+  free(req);
+}
+
+static void
+sqlite3_native__on_before_statement_exec(uv_work_t *handle) {
+  sqlite3_native_statement_exec_t *req = (sqlite3_native_statement_exec_t *) handle->data;
+
+  sqlite3_stmt *statement = req->statement->handle;
+  sqlite3 *db = req->statement->db->handle;
+
+  if (statement == NULL) {
+    req->error = sqlite3_mprintf("Statement has been finalized");
+    return;
+  }
+
+  int err = sqlite3_native__bind_values(req);
+  if (err != SQLITE_OK) {
+    req->error = sqlite3_native__sqlite_error(db);
+    return;
+  }
+
+  if (req->mode == SQLITE3_NATIVE_STATEMENT_RUN) {
+    while ((err = sqlite3_step(statement)) == SQLITE_ROW) {}
+
+    if (err != SQLITE_DONE) req->error = sqlite3_native__sqlite_error(db);
+  } else {
+    while ((err = sqlite3_step(statement)) == SQLITE_ROW) {
+      err = sqlite3_native__append_row(req);
+      if (err != SQLITE_OK) {
+        req->error = sqlite3_native__sqlite_error(db);
+        break;
+      }
+
+      if (req->mode == SQLITE3_NATIVE_STATEMENT_GET) break;
+    }
+
+    if (req->error == NULL && err != SQLITE_DONE && !(req->mode == SQLITE3_NATIVE_STATEMENT_GET && req->row_count > 0)) {
+      req->error = sqlite3_native__sqlite_error(db);
+    }
+  }
+
+  sqlite3_reset(statement);
+
+  req->changes = sqlite3_changes(db);
+  req->last_insert_rowid = sqlite3_last_insert_rowid(db);
+}
+
+static js_value_t *
+sqlite3_native_statement_exec(js_env_t *env, js_callback_info_t *info) {
+  int err;
+
+  size_t argc = 3;
+  js_value_t *argv[3];
+
+  err = js_get_callback_info(env, info, &argc, argv, NULL, NULL);
+  assert(err == 0);
+
+  assert(argc == 3);
+
+  uv_loop_t *loop;
+  err = js_get_env_loop(env, &loop);
+  assert(err == 0);
+
+  sqlite3_native_statement_t *statement;
+  err = js_get_arraybuffer_info(env, argv[0], (void **) &statement, NULL);
+  assert(err == 0);
+
+  int32_t mode;
+  err = js_get_value_int32(env, argv[2], &mode);
+  assert(err == 0);
+
+  sqlite3_native_statement_exec_t *req = calloc(1, sizeof(sqlite3_native_statement_exec_t));
+
+  req->statement = statement;
+  req->mode = mode;
+
+  err = sqlite3_native__parse_binds(env, argv[1], &req->binds, &req->bind_count);
+  assert(err == 0);
+
+  req->handle.data = (void *) req;
+
+  js_value_t *promise;
+  err = js_create_promise(env, &req->deferred, &promise);
+  assert(err == 0);
+
+  err = uv_queue_work(loop, &req->handle, sqlite3_native__on_before_statement_exec, sqlite3_native__on_after_statement_exec);
+  assert(err == 0);
+
+  return promise;
+}
+
+static void
+sqlite3_native__on_after_statement_finalize(uv_work_t *handle, int status) {
+  int err;
+
+  sqlite3_native_statement_finalize_t *req = (sqlite3_native_statement_finalize_t *) handle->data;
+
+  js_env_t *env = req->statement->env;
+
+  js_handle_scope_t *scope;
+  err = js_open_handle_scope(env, &scope);
+  assert(err == 0);
+
+  if (req->error) {
+    sqlite3_native__reject_deferred(env, req->deferred, req->error);
+    sqlite3_free(req->error);
+  } else {
+    js_value_t *result;
+    err = js_get_undefined(env, &result);
+    assert(err == 0);
+
+    err = js_resolve_deferred(env, req->deferred, result);
+    assert(err == 0);
+  }
+
+  err = js_close_handle_scope(env, scope);
+  assert(err == 0);
+
+  free(req);
+}
+
+static void
+sqlite3_native__on_before_statement_finalize(uv_work_t *handle) {
+  sqlite3_native_statement_finalize_t *req = (sqlite3_native_statement_finalize_t *) handle->data;
+
+  sqlite3_stmt *statement = req->statement->handle;
+  if (statement == NULL) return;
+
+  int err = sqlite3_finalize(statement);
+  req->statement->handle = NULL;
+
+  if (err != SQLITE_OK) req->error = sqlite3_native__sqlite_error(req->statement->db->handle);
+}
+
+static js_value_t *
+sqlite3_native_statement_finalize(js_env_t *env, js_callback_info_t *info) {
+  int err;
+
+  size_t argc = 1;
+  js_value_t *argv[1];
+
+  err = js_get_callback_info(env, info, &argc, argv, NULL, NULL);
+  assert(err == 0);
+
+  assert(argc == 1);
+
+  uv_loop_t *loop;
+  err = js_get_env_loop(env, &loop);
+  assert(err == 0);
+
+  sqlite3_native_statement_t *statement;
+  err = js_get_arraybuffer_info(env, argv[0], (void **) &statement, NULL);
+  assert(err == 0);
+
+  sqlite3_native_statement_finalize_t *req = calloc(1, sizeof(sqlite3_native_statement_finalize_t));
+
+  req->statement = statement;
+  req->handle.data = (void *) req;
+
+  js_value_t *promise;
+  err = js_create_promise(env, &req->deferred, &promise);
+  assert(err == 0);
+
+  err = uv_queue_work(loop, &req->handle, sqlite3_native__on_before_statement_finalize, sqlite3_native__on_after_statement_finalize);
+  assert(err == 0);
+
+  return promise;
+}
+
 static js_value_t *
 sqlite3_native_exports(js_env_t *env, js_value_t *exports) {
   int err;
@@ -1229,6 +2035,9 @@ sqlite3_native_exports(js_env_t *env, js_value_t *exports) {
   V("open", sqlite3_native_open)
   V("close", sqlite3_native_close)
   V("exec", sqlite3_native_exec)
+  V("prepare", sqlite3_native_prepare)
+  V("statementExec", sqlite3_native_statement_exec)
+  V("statementFinalize", sqlite3_native_statement_finalize)
 #undef V
 
   return exports;
