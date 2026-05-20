@@ -854,8 +854,6 @@ sqlite3_native_vfs_destroy(js_env_t *env, js_callback_info_t *info) {
   err = js_get_arraybuffer_info(env, argv[0], (void **) &vfs, NULL);
   assert(err == 0);
 
-  uv_sem_destroy(&vfs->done);
-
   err = sqlite3_vfs_unregister(&vfs->handle);
   assert(err == 0);
 
@@ -876,6 +874,8 @@ sqlite3_native_vfs_destroy(js_env_t *env, js_callback_info_t *info) {
 
   err = js_delete_reference(env, vfs->ctx);
   assert(err == 0);
+
+  uv_sem_destroy(&vfs->done);
 
   return NULL;
 }
