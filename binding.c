@@ -54,6 +54,10 @@ typedef struct {
   int64_t offset;
 
   int status;
+
+  // Owned by V8; we memcpy from it into `buf` once JS finishes the read.
+  // Kept at the end so the existing positional initializer still works.
+  void *js_buf;
 } sqlite3_native_read_t;
 
 typedef struct {
@@ -240,6 +244,15 @@ sqlite3_native__on_vfs_read_done(js_env_t *env, js_callback_info_t *info) {
 
   data->status = sqlite3_native__error_from(env, argv[0], SQLITE_IOERR_READ);
 
+  // Copy the bytes JS wrote into the V8-owned buffer back into SQLite's
+  // destination buffer. We use a V8-owned arraybuffer instead of the
+  // deprecated external arraybuffer because newer N-API runtimes
+  // (Electron 35+) refuse to create external arraybuffers and would
+  // otherwise leave args[1] uninitialized on the JS side.
+  if (data->status == SQLITE_OK && data->js_buf != NULL) {
+    memcpy(data->buf, data->js_buf, (size_t) data->len);
+  }
+
   uv_sem_post(&data->file->vfs->done);
 
   return NULL;
@@ -262,7 +275,11 @@ sqlite3_native__on_vfs_read_call(js_env_t *env, js_value_t *on_read, void *conte
   err = js_create_uint32(env, data->file->type, &args[0]);
   assert(err == 0);
 
-  err = js_create_external_arraybuffer(env, data->buf, data->len, NULL, NULL, &args[1]);
+  // V8-owned buffer (works under both Bare and Electron/N-API). The bytes
+  // JS writes here are copied into SQLite's destination buffer by the done
+  // callback (see sqlite3_native__on_vfs_read_done).
+  data->js_buf = NULL;
+  err = js_create_arraybuffer(env, (size_t) data->len, &data->js_buf, &args[1]);
   assert(err == 0);
 
   err = js_create_int64(env, data->offset, &args[2]);
@@ -336,8 +353,15 @@ sqlite3_native__on_vfs_write_call(js_env_t *env, js_value_t *on_write, void *con
   err = js_create_uint32(env, data->file->type, &args[0]);
   assert(err == 0);
 
-  err = js_create_external_arraybuffer(env, (void *) data->buf, data->len, NULL, NULL, &args[1]);
+  // Same rationale as on_vfs_read_call: avoid napi_create_external_arraybuffer
+  // because newer N-API runtimes (Electron 35+) reject it. Allocate a
+  // V8-owned arraybuffer and copy SQLite's source bytes into it before
+  // handing it to JS.
+  void *js_buf = NULL;
+  err = js_create_arraybuffer(env, (size_t) data->len, &js_buf, &args[1]);
   assert(err == 0);
+
+  memcpy(js_buf, data->buf, (size_t) data->len);
 
   err = js_create_int64(env, data->offset, &args[2]);
   assert(err == 0);
