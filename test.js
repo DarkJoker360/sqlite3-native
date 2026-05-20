@@ -140,6 +140,38 @@ test('prepared statements round trip blobs as buffers', async (t) => {
 })
 
 if (!isBare) {
+  test('default constructor opens sqlite3.db on disk', async (t) => {
+    const cwd = process.cwd()
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'sqlite3-native-default-'))
+    const filename = path.join(directory, 'sqlite3.db')
+
+    t.teardown(() => {
+      process.chdir(cwd)
+      fs.rmSync(directory, { recursive: true, force: true })
+    })
+
+    process.chdir(directory)
+
+    const first = new SQLite3()
+    await first.exec('CREATE TABLE records (NAME TEXT NOT NULL);')
+
+    const insert = await first.prepare('INSERT INTO records (NAME) VALUES (?)')
+    await insert.run('default-file')
+    await insert.finalize()
+    await first.close()
+
+    t.ok(fs.existsSync(filename))
+
+    const second = new SQLite3()
+    t.teardown(() => second.close())
+
+    const select = await second.prepare('SELECT NAME AS name FROM records;')
+    t.teardown(() => select.finalize())
+
+    const row = await select.get()
+    t.alike(row, { name: 'default-file' })
+  })
+
   test('filename opens a durable database on disk', async (t) => {
     const filename = path.join(
       os.tmpdir(),

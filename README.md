@@ -78,18 +78,15 @@ Values can be bound as `null`, numbers, strings, `Buffer`, typed arrays, or `Arr
 
 ### Durable files
 
-By default, `new SQLite3()` uses the in-memory JavaScript VFS. Pass `filename` to use SQLite's native file-backed storage:
+By default, `new SQLite3()` uses SQLite's native file-backed storage and opens `sqlite3.db` in the current working directory. Pass `filename` to choose the database path:
 
 ```js
+const defaultDb = new SQLite3()
 const appDb = new SQLite3({ filename: 'qvac.db' })
 const ragDb = new SQLite3({ filename: 'rag-vectors.db' })
 ```
 
-Custom VFS implementations remain available:
-
-```js
-const memory = new SQLite3({ vfs: new SQLite3.MemoryVFS() })
-```
+Custom VFS implementations remain available for advanced use.
 
 ## License
 

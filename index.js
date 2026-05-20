@@ -11,7 +11,7 @@ const STATEMENT_GET = 2
 module.exports = exports = class SQLite3 extends ReadyResource {
   constructor(opts = {}) {
     const { filename, name = filename || 'sqlite3.db' } = opts
-    const vfs = opts.vfs !== undefined ? opts.vfs : filename ? null : new MemoryVFS()
+    const vfs = opts.vfs === undefined ? null : opts.vfs
 
     super()
 
